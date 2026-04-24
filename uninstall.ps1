@@ -3,7 +3,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$TaskName = "BlockYouTube",
+    [string[]]$TaskNames = @("BlockYouTube", "BlockYouTube-Lock", "BlockYouTube-Sync"),
     [string]$InstallDir = "$env:ProgramData\BlockYouTube"
 )
 
@@ -15,10 +15,12 @@ if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "Run this script from an elevated (Administrator) PowerShell."
 }
 
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-    Write-Host "Removed scheduled task '$TaskName'."
+foreach ($TaskName in $TaskNames) {
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        Write-Host "Removed scheduled task '$TaskName'."
+    }
 }
 
 # Clean BlockYouTube section from the hosts file.

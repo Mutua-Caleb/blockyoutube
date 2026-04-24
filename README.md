@@ -9,16 +9,23 @@ browser, or a Tasker/HTTP-client shortcut). The Windows client works on
 ## How it works
 
 ```
- Android (edits gist) ──► GitHub Gist ──► (polled every 90s) ──► Windows client ──► hosts file
+ Android (edits gist) ──► GitHub Gist ──► (polled every 5 min) ──► Windows client ──► hosts file
 ```
 
-- The Windows client runs as a Scheduled Task under **SYSTEM** at boot.
-- It polls a small JSON doc and sets the Windows `hosts` file to either
-  block or allow the configured domains.
+- **Default-deny.** The hosts-file block is written during install, so
+  YouTube is unreachable from the moment install finishes — before any
+  scheduled task ever runs.
+- **Two short-lived Scheduled Tasks** run as **SYSTEM**:
+  - `BlockYouTube-Lock` — one-shot at boot, `--lock-only`, no network.
+    Re-asserts the block in case anything edited the hosts file.
+  - `BlockYouTube-Sync` — one-shot every 5 minutes. Polls the gist; if
+    unlocked, removes the block. If locked, ensures it's there.
+- Each task invocation finishes in seconds. There is no long-running
+  process to die. If the sync task ever stops working, you stay
+  blocked — the only thing it can do is *unlock*.
 - Entries are bracketed by `# BEGIN BLOCKYOUTUBE` / `# END BLOCKYOUTUBE`
   so the script never touches the rest of your hosts file.
-- If the network is down, the client keeps whatever state it last had
-  (defaulting to **locked** on first boot).
+- If the network is down, the sync task defaults to **locked**.
 
 ## One-time setup
 
@@ -55,15 +62,16 @@ library.
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\install.ps1
    ```
-   This copies the files to `C:\ProgramData\BlockYouTube\` and registers
-   a boot-time Scheduled Task called `BlockYouTube` running as SYSTEM.
+   This copies the files to `C:\ProgramData\BlockYouTube\`, writes the
+   block to the hosts file immediately, and registers two SYSTEM tasks:
+   `BlockYouTube-Lock` (boot) and `BlockYouTube-Sync` (every 5 min).
 
-4. Verify — open Task Scheduler → look for `BlockYouTube` (Running), or:
+4. Verify — try visiting `youtube.com` immediately, it should already be
+   blocked. To inspect:
    ```powershell
-   Get-ScheduledTask BlockYouTube
+   Get-ScheduledTask BlockYouTube-Lock, BlockYouTube-Sync
    Get-Content "$env:ProgramData\BlockYouTube\blocker.log" -Tail 20
    ```
-   Try visiting youtube.com — should fail to resolve within ~2 minutes.
 
 ## Unlocking from Android
 
@@ -72,7 +80,9 @@ library.
 1. Install the **GitHub** app, sign in.
 2. Open your gist, tap the pencil icon on `state.json`.
 3. Change `"locked": true` to `"locked": false`, save.
-4. Within ~90s the Windows machine clears the hosts entries.
+4. Within ~5 minutes the Windows machine clears the hosts entries.
+   (To force an immediate sync from the Windows side:
+   `Start-ScheduledTask -TaskName BlockYouTube-Sync` from any PowerShell.)
 
 ### Option B — Timed unlock (auto-relock)
 

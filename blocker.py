@@ -1,23 +1,27 @@
 """
 Windows site blocker with remote unlock.
 
-Polls a small JSON document (GitHub Gist by default) for lock state and
-keeps the Windows hosts file in sync. Runs as a long-lived process under
-a Scheduled Task with SYSTEM privileges so it survives reboots and
-cannot be stopped from a standard user account.
+Run as a one-shot from a Scheduled Task. Two task instances:
+
+  * boot-time:  blocker.py --lock-only   (no network call; writes the
+                block to the hosts file so YouTube is unreachable from
+                the moment the box finishes booting)
+  * every 5m:   blocker.py               (poll the gist; either keep
+                the block or remove it if the gist says unlocked)
+
+Both invocations exit within seconds. There is no long-running loop —
+the OS scheduler is the loop. If the sync task ever fails, the block
+stays in place; the only thing the sync task can do is *unlock*.
 
 Remote JSON format:
     {"locked": true}
 or to temporarily unlock until a wall-clock time (UTC):
     {"locked": false, "until": "2026-04-24T22:00:00Z"}
-
-When "until" is in the past the client treats the state as locked again
-so an unlock window auto-expires even if the remote file is never
-updated afterwards.
 """
 
 from __future__ import annotations
 
+import argparse
 import ctypes
 import json
 import logging
@@ -25,7 +29,6 @@ import os
 import socket
 import subprocess
 import sys
-import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,7 +92,8 @@ def probe_hosts_write() -> str:
 
 
 def fetch_remote_state(url: str, timeout: float) -> dict | None:
-    cache_bust = f"{'&' if '?' in url else '?'}t={int(time.time())}"
+    import time as _time
+    cache_bust = f"{'&' if '?' in url else '?'}t={int(_time.time())}"
     req = urllib.request.Request(
         url + cache_bust,
         headers={
@@ -230,57 +234,71 @@ def have_network() -> bool:
         return False
 
 
-def run_loop(config: dict) -> None:
-    url = config["remote_url"]
+def run_once(config: dict, lock_only: bool) -> int:
     domains = config["blocked_domains"]
-    poll = int(config.get("poll_seconds", 90))
     timeout = float(config.get("http_timeout_seconds", 10))
     offline_policy_locked = bool(config.get("offline_is_locked", True))
 
-    logging.info(
-        "starting; poll=%ss domains=%d identity=%s admin=%s probe=%s python=%s",
-        poll, len(domains), whoami(), is_admin(), probe_hosts_write(), sys.executable,
-    )
-    last_block_state: bool | None = None
-
-    while True:
-        if have_network():
+    if lock_only:
+        block = True
+        source = "lock-only"
+    else:
+        url = config.get("remote_url", "")
+        if not url or "YOUR_GIST" in url:
+            logging.error("remote_url not configured; defaulting to locked")
+            block = True
+            source = "no-config"
+        elif not have_network():
+            block = offline_policy_locked
+            source = "offline"
+        else:
             state = fetch_remote_state(url, timeout)
             if state is None:
-                block = offline_policy_locked if last_block_state is None else last_block_state
+                block = offline_policy_locked
+                source = "fetch-failed"
             else:
                 block = interpret_state(state)
-        else:
-            block = offline_policy_locked if last_block_state is None else last_block_state
+                source = f"remote({state})"
 
-        try:
-            changed = apply_state(block, domains)
-        except PermissionError as exc:
-            logging.error(
-                "hosts write blocked: winerror=%s strerror=%s filename=%s probe=%s",
-                getattr(exc, "winerror", None),
-                getattr(exc, "strerror", None),
-                getattr(exc, "filename", None),
-                probe_hosts_write(),
-            )
-            time.sleep(poll)
-            continue
-        except Exception as exc:
-            logging.exception("apply_state failed: %s", exc)
-            time.sleep(poll)
-            continue
+    logging.info(
+        "run mode=%s identity=%s admin=%s probe=%s python=%s",
+        "lock-only" if lock_only else "sync",
+        whoami(), is_admin(), probe_hosts_write(), sys.executable,
+    )
 
-        if changed:
-            logging.info("hosts updated: blocked=%s", block)
-            flush_dns()
-        elif last_block_state != block:
-            logging.info("state confirmed: blocked=%s", block)
+    try:
+        changed = apply_state(block, domains)
+    except PermissionError as exc:
+        logging.error(
+            "hosts write blocked: winerror=%s strerror=%s filename=%s probe=%s",
+            getattr(exc, "winerror", None),
+            getattr(exc, "strerror", None),
+            getattr(exc, "filename", None),
+            probe_hosts_write(),
+        )
+        return 6
+    except Exception as exc:
+        logging.exception("apply_state failed: %s", exc)
+        return 7
 
-        last_block_state = block
-        time.sleep(poll)
+    if changed:
+        logging.info("hosts updated: blocked=%s source=%s", block, source)
+        flush_dns()
+    else:
+        logging.info("state confirmed: blocked=%s source=%s", block, source)
+
+    return 0
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--lock-only",
+        action="store_true",
+        help="ensure the block is in place and exit; do not contact the network",
+    )
+    args = parser.parse_args()
+
     setup_logging()
     if os.name != "nt":
         logging.error("this script only runs on Windows")
@@ -298,16 +316,7 @@ def main() -> int:
         logging.error("config.json invalid: %s", exc)
         return 4
 
-    if not config.get("remote_url") or "YOUR_GIST" in config["remote_url"]:
-        logging.error("config.json: remote_url is not set")
-        return 5
-
-    try:
-        run_loop(config)
-    except KeyboardInterrupt:
-        logging.info("stopped by user")
-        return 0
-    return 0
+    return run_once(config, lock_only=args.lock_only)
 
 
 if __name__ == "__main__":
