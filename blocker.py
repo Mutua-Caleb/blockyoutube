@@ -62,6 +62,32 @@ def is_admin() -> bool:
         return False
 
 
+def whoami() -> str:
+    try:
+        out = subprocess.run(
+            ["whoami"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return (out.stdout or out.stderr or "").strip() or "?"
+    except Exception as exc:
+        return f"?({exc})"
+
+
+def probe_hosts_write() -> str:
+    """Return a short description of why a hosts write would fail, or 'ok'."""
+    try:
+        with HOSTS_PATH.open("a", encoding="utf-8"):
+            pass
+    except PermissionError as exc:
+        return f"open(append) PermissionError winerror={getattr(exc, 'winerror', None)} {exc}"
+    except Exception as exc:
+        return f"open(append) {type(exc).__name__}: {exc}"
+    return "ok"
+
+
 def fetch_remote_state(url: str, timeout: float) -> dict | None:
     cache_bust = f"{'&' if '?' in url else '?'}t={int(time.time())}"
     req = urllib.request.Request(
@@ -132,12 +158,21 @@ def read_hosts() -> list[str]:
 
 
 def write_hosts(lines: list[str]) -> None:
-    tmp = HOSTS_PATH.with_suffix(".blockyoutube.tmp")
     content = "\r\n".join(lines)
     if not content.endswith("\r\n"):
         content += "\r\n"
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, HOSTS_PATH)
+
+    # Clear read-only attribute defensively.
+    try:
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(HOSTS_PATH))
+        if attrs != 0xFFFFFFFF and (attrs & 0x1):
+            ctypes.windll.kernel32.SetFileAttributesW(str(HOSTS_PATH), attrs & ~0x1)
+    except Exception:
+        pass
+
+    # Write in place so we don't depend on os.replace working in System32.
+    with HOSTS_PATH.open("w", encoding="utf-8", newline="") as fh:
+        fh.write(content)
 
 
 def strip_block_section(lines: list[str]) -> list[str]:
@@ -202,7 +237,10 @@ def run_loop(config: dict) -> None:
     timeout = float(config.get("http_timeout_seconds", 10))
     offline_policy_locked = bool(config.get("offline_is_locked", True))
 
-    logging.info("starting; poll=%ss domains=%d", poll, len(domains))
+    logging.info(
+        "starting; poll=%ss domains=%d identity=%s admin=%s probe=%s python=%s",
+        poll, len(domains), whoami(), is_admin(), probe_hosts_write(), sys.executable,
+    )
     last_block_state: bool | None = None
 
     while True:
@@ -217,8 +255,14 @@ def run_loop(config: dict) -> None:
 
         try:
             changed = apply_state(block, domains)
-        except PermissionError:
-            logging.error("cannot write hosts file — process needs admin/SYSTEM privileges")
+        except PermissionError as exc:
+            logging.error(
+                "hosts write blocked: winerror=%s strerror=%s filename=%s probe=%s",
+                getattr(exc, "winerror", None),
+                getattr(exc, "strerror", None),
+                getattr(exc, "filename", None),
+                probe_hosts_write(),
+            )
             time.sleep(poll)
             continue
         except Exception as exc:
