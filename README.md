@@ -1,151 +1,190 @@
 # BlockYouTube
 
-A simple Windows website blocker with **remote unlock from Android**. Sites
-stay blocked on every boot; to unlock you flip one field in a JSON file
-hosted on a GitHub Gist (editable from the GitHub Android app, any phone
-browser, or a Tasker/HTTP-client shortcut). The Windows client works on
-**any network** because it just polls an HTTPS URL.
+Push-based site blocker for Windows, controlled remotely from your phone
+across **any network**, signed with HMAC so the channel can't be hijacked.
+Locks YouTube + a configurable list of social-media domains via the hosts
+file. Default-deny on every failure path — the remote channel can only
+ever *unblock*; it can never silently lose a block.
 
-## How it works
+## Architecture
 
 ```
- Android (edits gist) ──► GitHub Gist ──► (polled every 5 min) ──► Windows client ──► hosts file
+  ┌──────────────┐    POST signed JSON    ┌───────────┐    SSE stream    ┌──────────────────┐
+  │  Android PWA │ ─────────────────────► │  ntfy.sh  │ ───────────────► │  Windows agent   │
+  │ (controller/)│                        │ (broker)  │                  │   (agent.py)     │
+  │              │ ◄──────EventSource──── │           │ ◄──── POST ───── │ writes hosts +   │
+  └──────────────┘   live status topic    └───────────┘  heartbeat 60s   │ heartbeats       │
+                                                                          └──────────────────┘
 ```
 
-- **Default-deny.** The hosts-file block is written during install, so
-  YouTube is unreachable from the moment install finishes — before any
-  scheduled task ever runs.
-- **Two short-lived Scheduled Tasks** run as **SYSTEM**:
-  - `BlockYouTube-Lock` — one-shot at boot, `--lock-only`, no network.
-    Re-asserts the block in case anything edited the hosts file.
-  - `BlockYouTube-Sync` — one-shot every 5 minutes. Polls the gist; if
-    unlocked, removes the block. If locked, ensures it's there.
-- Each task invocation finishes in seconds. There is no long-running
-  process to die. If the sync task ever stops working, you stay
-  blocked — the only thing it can do is *unlock*.
-- Entries are bracketed by `# BEGIN BLOCKYOUTUBE` / `# END BLOCKYOUTUBE`
-  so the script never touches the rest of your hosts file.
-- If the network is down, the sync task defaults to **locked**.
+- **Broker:** [`ntfy.sh`](https://ntfy.sh) — free, public, pub/sub over HTTP.
+  No account, no API keys. Self-hostable when you want to. Two random topic
+  names act as the channel; one for commands, one for status.
+- **Authentication:** Every command is HMAC-SHA256 signed with a 32-byte
+  secret. The agent rejects bad signatures, replayed nonces, malformed
+  payloads, or `until` timestamps already in the past. Topic-name leak
+  alone gets an attacker nothing.
+- **Push, not poll:** Windows agent holds a long-lived HTTP stream
+  (`/json` ndjson) to the cmd topic. Commands land in <1s, not 5 min.
+- **Live status:** Agent publishes `{mode, allow, until, host, ts}` to
+  the status topic every 60s. The PWA's traffic-light dot turns green/
+  yellow/red based on heartbeat age, so you always know whether the
+  agent is actually reachable.
+- **Default-deny on every error:** missing config, bad signature, expired
+  `until`, network drop, broker outage, hosts-write failure, unknown
+  command verb — all collapse to "blocked". The agent is also restarted
+  by the OS on crash, with a one-shot boot lock task that re-applies the
+  last persisted state before the agent has reconnected.
+
+## Components
+
+| Path                  | Purpose                                                 |
+| --------------------- | ------------------------------------------------------- |
+| `agent.py`            | Long-lived Windows daemon (subscribe + apply + status). |
+| `keygen.py`           | Generates a fresh secret + topic pair into config.json. |
+| `cli.py`              | Cross-platform CLI controller for testing / scripting.  |
+| `config.json`         | Topics, secret, categories, default-blocked list.       |
+| `install.ps1`         | Registers two SYSTEM scheduled tasks.                   |
+| `uninstall.ps1`       | Removes tasks, cleans hosts, kills lingering agent.     |
+| `controller/`         | Static PWA — Android home-screen controller.            |
 
 ## One-time setup
 
-### 1. Create the remote state file (GitHub Gist)
+### 1. Generate a topic + secret on the Windows machine
 
-1. Go to <https://gist.github.com> → **New gist**.
-2. Filename: `state.json`. Contents:
-   ```json
-   { "locked": true }
-   ```
-3. Create it as a **secret gist** (the URL is unguessable; nobody can
-   edit it without your GitHub login, and the Windows client only needs
-   to read it).
-4. Click **Raw** and copy the URL. It will look like:
-   `https://gist.githubusercontent.com/<user>/<id>/raw/state.json`
-
-### 2. Install Python on the Windows machine
-
-Install Python 3.10+ from <https://www.python.org/downloads/windows/>.
-When installing:
-
-- Check **Add python.exe to PATH**
-- Choose **Install for all users** (so the SYSTEM account finds it too)
-
-No extra packages are required — the blocker uses only the standard
-library.
-
-### 3. Configure and install
-
-1. Copy this folder to the Windows machine.
-2. Edit `config.json` and paste your Gist raw URL into `remote_url`.
-   Add or remove domains in `blocked_domains` as you like.
-3. Open **PowerShell as Administrator** in this folder and run:
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\install.ps1
-   ```
-   This copies the files to `C:\ProgramData\BlockYouTube\`, writes the
-   block to the hosts file immediately, and registers two SYSTEM tasks:
-   `BlockYouTube-Lock` (boot) and `BlockYouTube-Sync` (every 5 min).
-
-4. Verify — try visiting `youtube.com` immediately, it should already be
-   blocked. To inspect:
-   ```powershell
-   Get-ScheduledTask BlockYouTube-Lock, BlockYouTube-Sync
-   Get-Content "$env:ProgramData\BlockYouTube\blocker.log" -Tail 20
-   ```
-
-## Unlocking from Android
-
-### Option A — GitHub Android app (simplest)
-
-1. Install the **GitHub** app, sign in.
-2. Open your gist, tap the pencil icon on `state.json`.
-3. Change `"locked": true` to `"locked": false`, save.
-4. Within ~5 minutes the Windows machine clears the hosts entries.
-   (To force an immediate sync from the Windows side:
-   `Start-ScheduledTask -TaskName BlockYouTube-Sync` from any PowerShell.)
-
-### Option B — Timed unlock (auto-relock)
-
-Edit `state.json` to:
-
-```json
-{ "locked": false, "until": "2026-04-24T22:00:00Z" }
+```powershell
+cd <this folder>
+python keygen.py --write config.json
 ```
 
-`until` is a UTC timestamp. When it passes the client treats the state
-as locked again, even if you forget to change the gist back. Great for
-"give me 1 hour" windows.
+This writes a fresh `cmd_topic`, `status_topic` and `secret` into
+`config.json` (preserving your category lists if any). It also prints
+the controller-side snippet to stdout — copy that block, you'll paste it
+into the phone in step 4.
 
-### Option C — HTTP shortcut (fastest, one tap)
+### 2. Install Python 3.10+ on the Windows machine
 
-Create a personal access token at <https://github.com/settings/tokens>
-with **gist** scope only. In any HTTP client on your phone (HTTP
-Shortcuts, Tasker, etc.) create a request:
+From <https://www.python.org/downloads/windows/>:
 
-- Method: `PATCH`
-- URL: `https://api.github.com/gists/<YOUR_GIST_ID>`
-- Headers:
-  - `Authorization: Bearer <YOUR_TOKEN>`
-  - `Accept: application/vnd.github+json`
-- Body (unlock for 1 hour — recompute `until` in the shortcut if you can,
-  or just flip the flag):
-  ```json
-  {"files":{"state.json":{"content":"{\"locked\": false}"}}}
-  ```
+- Check **Add python.exe to PATH**
+- **Install for all users** (so the SYSTEM account can find it)
 
-Make a second shortcut with `"locked": true` to relock on demand.
+No third-party packages required — agent uses only the standard library.
 
-> Keep the token on-device only. Treat it like a password — anyone with
-> it and the gist URL can toggle your lock.
+### 3. Run the installer
+
+In an **elevated PowerShell**, in this folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+This:
+
+- Copies `agent.py` + `config.json` to `C:\ProgramData\BlockYouTube\`.
+- Writes the hosts-file block immediately (default-deny).
+- Registers two scheduled tasks running as `SYSTEM`:
+  - `BlockYouTube-Lock` — boot one-shot, `--lock-only`, no network.
+  - `BlockYouTube-Agent` — long-lived push subscriber. Restarts on crash.
+- Starts the agent right away so you can test without rebooting.
+
+Verify:
+
+```powershell
+Get-ScheduledTask BlockYouTube-Lock, BlockYouTube-Agent
+Get-Content "$env:ProgramData\BlockYouTube\agent.log" -Tail 30 -Wait
+```
+
+### 4. Set up the phone (PWA)
+
+Host `controller/` somewhere your phone can reach — easiest options:
+
+- **GitHub Pages** — push `controller/` to a public repo, enable Pages.
+  The PWA does no server-side anything; it's pure static HTML/JS.
+- **Localhost on the phone** — copy `controller/` to your phone and run
+  any static file server (e.g. Termux + `python -m http.server`).
+- **Any static host** — Netlify, Vercel, Cloudflare Pages, S3.
+
+> The PWA holds your secret in `localStorage`. It does not need to
+> phone home anywhere except `ntfy.sh`. Ideally serve it over HTTPS
+> from a host you trust.
+
+On your Android phone:
+
+1. Open the page in Chrome.
+2. **Add to Home screen** (the page is a PWA — installable, works offline).
+3. On first launch, paste the JSON snippet `keygen.py` printed in step 1
+   into the setup field. Tap **Save**.
+4. The status indicator should turn green within ~60s, showing the
+   current mode (`locked` / `unlocked …`) and host name.
+
+## Using it
+
+- **Block everything**: red button. Sets `mode=block_all`.
+- **Unblock for 15 min / 30 min / 1 h / 3 h / no limit**: quick buttons.
+  If no categories are checked it unblocks all of them; otherwise it
+  unblocks only the ones you checked.
+- **Apply allowlist**: same idea but with no automatic relock.
+- **Ping**: nudges the agent to publish a fresh heartbeat (handy when
+  testing).
+
+The traffic-light indicator at the top is your liveness signal:
+
+| Color   | Meaning                                          |
+| ------- | ------------------------------------------------ |
+| Green   | Heartbeat <90s old. Agent reachable. State shown. |
+| Yellow  | Heartbeat 90s–5min old. Agent likely fine, slow. |
+| Red     | No heartbeat for 5+ min. Agent unreachable.      |
+| Grey    | No heartbeat received yet (just opened).         |
+
+## Using the CLI controller
+
+For desktop testing, scripting, or as a fallback when the phone is
+dead:
+
+```bash
+# Make a controller-only config (the four fields the PWA also needs).
+python keygen.py > controller-config.json   # only on a fresh install
+
+python cli.py --config controller-config.json status
+python cli.py --config controller-config.json block
+python cli.py --config controller-config.json unblock --for 30m
+python cli.py --config controller-config.json unblock --only youtube --until 2026-04-25T22:00Z
+```
+
+## Customising the blocklist
+
+Edit `categories` and `default_blocked` in `config.json`. Re-run
+`install.ps1` (or just copy the file to `C:\ProgramData\BlockYouTube\`)
+— the agent picks up changes the next time it restarts. The PWA's
+allowlist checkboxes are wired to a hard-coded list in `controller/app.js`;
+add any new category names there too.
+
+## Threat model
+
+- **Soft block.** Anyone with local admin can stop the task or edit
+  the hosts file. This is for resisting your own impulses, not an
+  adversary on your machine.
+- **DNS-over-HTTPS bypasses the hosts file.** Disable DoH in your
+  browser, or push the blocklist down a layer (Pi-hole, NextDNS,
+  router). The hosts-file approach catches every app that uses the
+  system resolver — most do.
+- **Topic name + secret should be treated as a password.** Anyone
+  with both can unblock. Topic name alone is useless without the
+  secret (HMAC). Secret alone is useless without the topic name.
+- **`ntfy.sh` operator can see traffic.** They see the topic names
+  and the JSON payloads (signatures + commands). They can't forge
+  commands without the secret. If you don't want a third party seeing
+  your social-media usage pattern, self-host ntfy and point
+  `ntfy_base` at it.
 
 ## Uninstall
 
-From an elevated PowerShell in this folder:
+From an elevated PowerShell:
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```
-Removes the task and scrubs the `BLOCKYOUTUBE` section of the hosts file.
 
-## Files
-
-| File | Purpose |
-| --- | --- |
-| `blocker.py` | The polling daemon (stdlib only). |
-| `config.json` | Remote URL, poll interval, blocked domain list. |
-| `install.ps1` | Copies files, registers the boot-time Scheduled Task. |
-| `uninstall.ps1` | Removes the task and cleans the hosts file. |
-| `state.example.json` | Example contents for your Gist. |
-
-## Caveats and threat model
-
-- This is a soft block. Anyone with local admin can disable the task or
-  edit the hosts file. It's aimed at resisting your own impulses, not an
-  adversary on your machine.
-- Apps that use DNS-over-HTTPS (e.g. Chrome with DoH enabled) can bypass
-  the hosts file. Disable DoH in the browser, or push the blocklist
-  lower (e.g. via a hosts-level tool like a Windows firewall rule) if
-  you need stronger enforcement.
-- GitHub's raw-gist CDN sometimes serves cached content for ~60s; the
-  client adds a cache-buster query string, but unlocks may still take a
-  poll cycle to take effect. Increase `poll_seconds` in `config.json`
-  if you want to be gentler on GitHub's rate limits.
+Removes the tasks, kills any lingering agent process, and scrubs the
+`BLOCKYOUTUBE` section from the hosts file.

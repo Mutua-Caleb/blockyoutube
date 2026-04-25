@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0c10">
+<title>BlockYouTube Remote</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>BlockYouTube</h1>
+    <div id="indicator" class="indicator unknown">
+      <span class="dot"></span>
+      <span id="indicator-text">offline</span>
+    </div>
+  </header>
+
+  <section id="setup-section" class="card hidden">
+    <h2>One-time setup</h2>
+    <p>Paste the JSON snippet from <code>python keygen.py</code> on the Windows machine. It contains the topic names and shared secret. Stored only in this browser (localStorage).</p>
+    <textarea id="setup-json" rows="8" placeholder='{ "cmd_topic": "bk-cmd-...", "status_topic": "bk-stat-...", "secret": "...", "ntfy_base": "https://ntfy.sh" }'></textarea>
+    <div class="row">
+      <button id="setup-save">Save</button>
+      <button id="setup-clear" class="ghost">Clear stored config</button>
+    </div>
+    <p class="error" id="setup-error"></p>
+  </section>
+
+  <section id="status-card" class="card hidden">
+    <h2>Status</h2>
+    <dl>
+      <dt>Mode</dt><dd id="status-mode">—</dd>
+      <dt>Allowed</dt><dd id="status-allow">—</dd>
+      <dt>Until</dt><dd id="status-until">—</dd>
+      <dt>Last heartbeat</dt><dd id="status-seen">—</dd>
+      <dt>Host</dt><dd id="status-host">—</dd>
+    </dl>
+  </section>
+
+  <section id="actions-card" class="card hidden">
+    <h2>Actions</h2>
+
+    <div class="action-group">
+      <h3>Block</h3>
+      <button id="btn-block" class="primary big">Block everything</button>
+    </div>
+
+    <div class="action-group">
+      <h3>Unblock for…</h3>
+      <div class="grid">
+        <button class="quick" data-mins="15">15 min</button>
+        <button class="quick" data-mins="30">30 min</button>
+        <button class="quick" data-mins="60">1 hour</button>
+        <button class="quick" data-mins="180">3 hours</button>
+        <button class="quick" data-mins="0">No limit</button>
+      </div>
+    </div>
+
+    <div class="action-group">
+      <h3>Allow only specific apps</h3>
+      <div id="categories" class="checks"></div>
+      <button id="btn-unblock-some" class="primary">Apply allowlist</button>
+    </div>
+
+    <div class="action-group">
+      <h3>Diagnostics</h3>
+      <button id="btn-ping" class="ghost">Ping (force heartbeat)</button>
+      <a href="#" id="btn-settings" class="ghost-link">Settings</a>
+    </div>
+
+    <p id="action-feedback" class="feedback"></p>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

@@ -2,22 +2,22 @@
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1
 #
 # What this does:
-#   1. Resolves the full path to python.exe (so SYSTEM never has to use PATH).
-#   2. Copies blocker.py + config.json into C:\ProgramData\BlockYouTube\.
-#   3. WRITES THE HOSTS-FILE BLOCK IMMEDIATELY so YouTube is blocked from
-#      this moment, even before any task runs.
+#   1. Resolves python.exe (so SYSTEM never has to use PATH).
+#   2. Copies agent.py + config.json into C:\ProgramData\BlockYouTube\.
+#   3. WRITES THE HOSTS-FILE BLOCK IMMEDIATELY (default-deny).
 #   4. Registers two scheduled tasks running as SYSTEM:
 #        - BlockYouTube-Lock:  one-shot at boot, --lock-only (no network).
-#        - BlockYouTube-Sync:  one-shot every 5 minutes, polls the gist.
-#      Both exit within seconds. There is no long-running process to die.
+#                              Default-deny while the daemon is starting up.
+#        - BlockYouTube-Agent: long-lived push subscriber. At startup, with
+#                              auto-restart on crash. Holds an SSE connection
+#                              to ntfy and reacts to signed commands in <1s.
 
 [CmdletBinding()]
 param(
-    [string]$LockTaskName = "BlockYouTube-Lock",
-    [string]$SyncTaskName = "BlockYouTube-Sync",
-    [string]$PythonExe = "",
-    [string]$InstallDir = "$env:ProgramData\BlockYouTube",
-    [int]$SyncIntervalMinutes = 5
+    [string]$LockTaskName  = "BlockYouTube-Lock",
+    [string]$AgentTaskName = "BlockYouTube-Agent",
+    [string]$PythonExe     = "",
+    [string]$InstallDir    = "$env:ProgramData\BlockYouTube"
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,16 +31,19 @@ function Assert-Admin {
 }
 Assert-Admin
 
-# Resolve the full path to python.exe. Don't trust PATH for the SYSTEM account.
+# Resolve python.exe. Prefer pythonw.exe for the daemon (no console window),
+# but only if it sits next to a working python.exe.
 if (-not $PythonExe) {
     $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
     if ($cmd) {
         $PythonExe = $cmd.Source
     } else {
         $candidates = @(
+            "C:\Program Files\Python313\python.exe",
             "C:\Program Files\Python312\python.exe",
             "C:\Program Files\Python311\python.exe",
             "C:\Program Files\Python310\python.exe",
+            "C:\Python313\python.exe",
             "C:\Python312\python.exe",
             "C:\Python311\python.exe"
         ) | Where-Object { Test-Path $_ }
@@ -50,46 +53,55 @@ if (-not $PythonExe) {
 if (-not $PythonExe -or -not (Test-Path $PythonExe)) {
     throw "Could not locate python.exe. Pass it explicitly: -PythonExe 'C:\Path\To\python.exe'"
 }
-Write-Host "Using Python at: $PythonExe"
+$PythonwExe = Join-Path (Split-Path -Parent $PythonExe) "pythonw.exe"
+if (-not (Test-Path $PythonwExe)) { $PythonwExe = $PythonExe }
+
+Write-Host "Using Python:    $PythonExe"
+Write-Host "Daemon Python:   $PythonwExe"
 
 $scriptSource = $PSScriptRoot
 if (-not $scriptSource) { $scriptSource = Split-Path -Parent $MyInvocation.MyCommand.Path }
 
 Write-Host "Installing to $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-Copy-Item -Force -Path (Join-Path $scriptSource "blocker.py") -Destination $InstallDir
-if (-not (Test-Path (Join-Path $InstallDir "config.json"))) {
-    Copy-Item -Force -Path (Join-Path $scriptSource "config.json") -Destination $InstallDir
-    Write-Warning "Edit $InstallDir\config.json and set remote_url to your Gist raw URL."
+Copy-Item -Force -Path (Join-Path $scriptSource "agent.py") -Destination $InstallDir
+
+$installedConfig = Join-Path $InstallDir "config.json"
+$sourceConfig    = Join-Path $scriptSource "config.json"
+$sourceKeygen    = Join-Path $scriptSource "keygen.py"
+if (-not (Test-Path $installedConfig)) {
+    if (Test-Path $sourceConfig) {
+        Copy-Item -Force -Path $sourceConfig -Destination $installedConfig
+    } else {
+        # Generate a fresh skeleton via keygen.py (must be in the source dir)
+        & $PythonExe $sourceKeygen --write $installedConfig
+    }
+    Write-Warning "Edit $installedConfig (cmd_topic / status_topic / secret) -- this same JSON goes into the phone PWA."
 } else {
-    Write-Host "Keeping existing config.json at $InstallDir\config.json"
+    Write-Host "Keeping existing config.json at $installedConfig"
 }
 
-$blockerPath = Join-Path $InstallDir "blocker.py"
+$agentPath = Join-Path $InstallDir "agent.py"
+$configPath = Join-Path $InstallDir "config.json"
 
 # Default-deny: write the hosts block right now so YouTube is blocked even
-# before any scheduled task runs. We just invoke the script in --lock-only
-# mode synchronously from this elevated shell.
+# before any scheduled task runs. --lock-only does not touch the network.
 Write-Host "Writing initial hosts-file block ..."
-& $PythonExe $blockerPath --lock-only
+& $PythonExe $agentPath --config $configPath --lock-only
 if ($LASTEXITCODE -ne 0) {
-    Write-Warning "Initial lock returned exit code $LASTEXITCODE; check $InstallDir\blocker.log"
+    Write-Warning "Initial lock returned exit code $LASTEXITCODE; check $InstallDir\agent.log"
 }
 
-function Register-OneShotTask {
+function Register-Task {
     param(
         [string]$Name,
+        [string]$Exe,
         [string]$ArgString,
-        $Trigger
+        $Trigger,
+        $Settings
     )
-    $action = New-ScheduledTaskAction -Execute $PythonExe -Argument $ArgString -WorkingDirectory $InstallDir
+    $action = New-ScheduledTaskAction -Execute $Exe -Argument $ArgString -WorkingDirectory $InstallDir
     $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet `
-        -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
-        -MultipleInstances IgnoreNew
 
     if (Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $Name -Confirm:$false
@@ -99,29 +111,55 @@ function Register-OneShotTask {
         -Action $action `
         -Trigger $Trigger `
         -Principal $principal `
-        -Settings $settings | Out-Null
+        -Settings $Settings | Out-Null
     Write-Host "Registered task: $Name"
 }
 
-# Boot task — one-shot, --lock-only, no network call.
-$bootTrigger = New-ScheduledTaskTrigger -AtStartup
-Register-OneShotTask `
+# Boot lock task: one-shot, --lock-only, no network. Finishes in seconds.
+$lockTrigger = New-ScheduledTaskTrigger -AtStartup
+$lockSettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+    -MultipleInstances IgnoreNew
+
+Register-Task `
     -Name $LockTaskName `
-    -ArgString ("`"{0}`" --lock-only" -f $blockerPath) `
-    -Trigger $bootTrigger
+    -Exe $PythonExe `
+    -ArgString ("`"{0}`" --config `"{1}`" --lock-only" -f $agentPath, $configPath) `
+    -Trigger $lockTrigger `
+    -Settings $lockSettings
 
-# Sync task — runs every N minutes, indefinitely, starting now.
-$syncTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(30) `
-    -RepetitionInterval (New-TimeSpan -Minutes $SyncIntervalMinutes) `
-    -RepetitionDuration ([TimeSpan]::FromDays(3650))
-Register-OneShotTask `
-    -Name $SyncTaskName `
-    -ArgString ("`"{0}`"" -f $blockerPath) `
-    -Trigger $syncTrigger
+# Long-lived agent task: at boot. If it dies, restart in 1 minute, indefinitely.
+# ExecutionTimeLimit set to 0 means "run forever".
+$agentTrigger = New-ScheduledTaskTrigger -AtStartup
+$agentSettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -RestartCount 999 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -MultipleInstances IgnoreNew
 
-Start-ScheduledTask -TaskName $SyncTaskName
+Register-Task `
+    -Name $AgentTaskName `
+    -Exe $PythonwExe `
+    -ArgString ("`"{0}`" --config `"{1}`"" -f $agentPath, $configPath) `
+    -Trigger $agentTrigger `
+    -Settings $agentSettings
+
+# Kick the agent off now so we don't have to reboot to test.
+Start-ScheduledTask -TaskName $AgentTaskName
+
 Write-Host ""
 Write-Host "Installed."
 Write-Host "  Boot lock:  $LockTaskName  (one-shot at startup, no network)"
-Write-Host "  Sync poll:  $SyncTaskName  (every $SyncIntervalMinutes minutes)"
-Write-Host "  Logs:       $InstallDir\blocker.log"
+Write-Host "  Agent:      $AgentTaskName  (long-lived push subscriber)"
+Write-Host "  Logs:       $InstallDir\agent.log"
+Write-Host ""
+Write-Host "Next steps:"
+Write-Host "  1. Copy the {ntfy_base, cmd_topic, status_topic, secret} block from"
+Write-Host "     $configPath into your Android PWA setup screen."
+Write-Host "  2. From any machine: python cli.py --config <controller.json> status"
