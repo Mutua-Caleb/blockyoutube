@@ -1,24 +1,29 @@
 {
-  "remote_url": "https://gist.githubusercontent.com/YOUR_USERNAME/YOUR_GIST_ID/raw/state.json",
-  "poll_seconds": 90,
-  "http_timeout_seconds": 10,
-  "offline_is_locked": true,
-  "blocked_domains": [
-    "youtube.com",
-    "m.youtube.com",
-    "youtu.be",
-    "youtubei.googleapis.com",
-    "yt3.ggpht.com",
-    "ytimg.com",
-    "i.ytimg.com",
-    "facebook.com",
-    "m.facebook.com",
-    "instagram.com",
-    "tiktok.com",
-    "reddit.com",
-    "twitter.com",
-    "x.com",
-    "twitch.tv",
-    "netflix.com"
+  "ntfy_base": "https://ntfy.sh",
+  "cmd_topic": "REPLACE-WITH-OUTPUT-FROM-keygen.py",
+  "status_topic": "REPLACE-WITH-OUTPUT-FROM-keygen.py",
+  "secret": "REPLACE-WITH-OUTPUT-FROM-keygen.py",
+  "categories": {
+    "youtube": [
+      "youtube.com",
+      "m.youtube.com",
+      "youtu.be",
+      "youtubei.googleapis.com",
+      "yt3.ggpht.com",
+      "ytimg.com",
+      "i.ytimg.com"
+    ],
+    "facebook":  ["facebook.com", "m.facebook.com", "fb.com", "fbcdn.net"],
+    "instagram": ["instagram.com", "cdninstagram.com"],
+    "tiktok":    ["tiktok.com", "tiktokcdn.com"],
+    "twitter":   ["twitter.com", "x.com", "t.co"],
+    "reddit":    ["reddit.com", "redd.it"],
+    "snapchat":  ["snapchat.com"],
+    "twitch":    ["twitch.tv"],
+    "netflix":   ["netflix.com"]
+  },
+  "default_blocked": [
+    "youtube", "facebook", "instagram", "tiktok",
+    "twitter", "reddit", "snapchat", "twitch", "netflix"
   ]
 }

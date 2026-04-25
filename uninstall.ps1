@@ -1,9 +1,14 @@
-# Removes the BlockYouTube scheduled task and cleans hosts-file entries.
+# Removes the BlockYouTube scheduled tasks and cleans hosts-file entries.
 # Run from an elevated PowerShell:  powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 
 [CmdletBinding()]
 param(
-    [string[]]$TaskNames = @("BlockYouTube", "BlockYouTube-Lock", "BlockYouTube-Sync"),
+    [string[]]$TaskNames = @(
+        "BlockYouTube",
+        "BlockYouTube-Lock",
+        "BlockYouTube-Sync",
+        "BlockYouTube-Agent"
+    ),
     [string]$InstallDir = "$env:ProgramData\BlockYouTube"
 )
 
@@ -17,11 +22,21 @@ if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
 
 foreach ($TaskName in $TaskNames) {
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
         Write-Host "Removed scheduled task '$TaskName'."
     }
 }
+
+# Make sure no straggling python processes are still running the agent.
+Get-CimInstance Win32_Process |
+    Where-Object { $_.CommandLine -and $_.CommandLine -match "agent\.py" } |
+    ForEach-Object {
+        try {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            Write-Host "Stopped agent PID $($_.ProcessId)."
+        } catch {}
+    }
 
 # Clean BlockYouTube section from the hosts file.
 $hosts = "$env:SystemRoot\System32\drivers\etc\hosts"
